@@ -34,7 +34,8 @@ test('validates question, outcomes, description and duration', () => {
   bad({ question: 'Hi?' });
   bad({ question: 'x'.repeat(201) });
   bad({ outcomes: ['YES'] });
-  bad({ outcomes: ['YES', 'NO', 'MAYBE'] });
+  bad({ outcomes: Array.from({ length: 11 }, (_, i) => `Option ${i + 1}`) });
+  bad({ outcomes: ['A', 'B', 'a'] });
   bad({ outcomes: ['YES', 'yes'] });
   bad({ outcomes: ['YES', ''] });
   bad({ outcomes: ['YES', 'x'.repeat(51)] });
@@ -44,6 +45,10 @@ test('validates question, outcomes, description and duration', () => {
   bad({ duration: '91d' });
   bad({ duration: 'tomorrow' });
   for (const duration of ['30m', '6h', '2d', '7d', '1w', '1d12h']) create(services, { duration, question: `Question for ${duration}?` });
+  const three = create(services, { question: 'Who wins the derby?', outcomes: ['Home', 'Draw', 'Away'] }).market;
+  assert.deepEqual(three.outcomes.map((o) => [o.idx, o.label]), [[0, 'Home'], [1, 'Draw'], [2, 'Away']]);
+  const ten = create(services, { question: 'Which number wins?', outcomes: Array.from({ length: 10 }, (_, i) => `N${i}`) }).market;
+  assert.equal(ten.outcomes.length, 10);
 });
 
 test('neutralises mass mentions in user text', () => {

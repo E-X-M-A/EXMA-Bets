@@ -79,16 +79,34 @@ async function handleModal(ctx, interaction) {
     case 'createModal':
       return flows.createMarket(ctx, interaction, {
         question: field('question'),
-        outcomeA: field('outcome_a'),
-        outcomeB: field('outcome_b'),
+        outcomes: parseOutcomeLines(field('outcomes')),
         duration: field('duration'),
         description: field('description'),
       });
     case 'betModal':
       return flows.prepareBet(ctx, interaction, Number(parsed.args[0]), Number(parsed.args[1]), field('stake'));
+    case 'resolveModal': {
+      if (!flows.isAdmin(interaction)) throw new UserError('You need the Administrator permission to do this.');
+      const reason = field('reason').trim();
+      if (!reason) throw new UserError('A reason is required.');
+      return flows.prepareResolve(ctx, interaction, {
+        marketId: Number(parsed.args[0]),
+        outcome: Number(parsed.args[1]),
+        admin: true,
+        reason,
+      });
+    }
     default:
       throw new UserError('This form is outdated. Please try again.');
   }
+}
+
+/** "YES\nNO\n\nMaybe " -> ['YES', 'NO', 'Maybe'] (blank lines ignored). */
+function parseOutcomeLines(text) {
+  return String(text ?? '')
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
 }
 
 async function handleComponent(ctx, interaction) {
@@ -100,6 +118,12 @@ async function handleComponent(ctx, interaction) {
       return flows.openBetModal(ctx, interaction, Number(a), Number(b));
     case 'position':
       return flows.showPosition(ctx, interaction, Number(a));
+    case 'resolve':
+      return flows.resolveButton(ctx, interaction, Number(a), Number(b));
+    case 'results':
+      return flows.showResults(ctx, interaction, Number(a), 1);
+    case 'resultsPage':
+      return flows.showResults(ctx, interaction, Number(a), Number(b), { flip: true });
     case 'confirm':
       return flows.handleConfirm(ctx, interaction, a);
     case 'abort':
@@ -139,4 +163,4 @@ async function reportError(interaction, err, kind) {
   }
 }
 
-module.exports = { createInteractionHandler };
+module.exports = { createInteractionHandler, parseOutcomeLines };

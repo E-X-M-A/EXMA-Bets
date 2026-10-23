@@ -16,6 +16,8 @@ const STATUS_CHOICES = [
   { name: 'Cancelled', value: STATUS.CANCELLED },
 ];
 
+const OUTCOME_OPTION_LETTERS = 'abcdefghij'.slice(0, LIMITS.maxOutcomes).split('');
+
 const marketIdOption = (o) =>
   o.setName('market_id').setDescription('Market ID (e.g. 12)').setRequired(true).setMinValue(1).setAutocomplete(true);
 const outcomeOption = (o, description) =>
@@ -25,7 +27,7 @@ const data = new SlashCommandBuilder()
   .setName('market')
   .setDescription('Prediction markets')
   .setContexts(InteractionContextType.Guild)
-  .addSubcommand((s) =>
+  .addSubcommand((s) => {
     s
       .setName('create')
       .setDescription('Create a market (leave options empty to use a form)')
@@ -35,8 +37,15 @@ const data = new SlashCommandBuilder()
       .addStringOption((o) => o.setName('duration').setDescription('Betting window: 30m, 6h, 2d, 7d…').setMaxLength(12))
       .addStringOption((o) =>
         o.setName('description').setDescription('Context or resolution criteria').setMaxLength(LIMITS.descriptionMax),
-      ),
-  )
+      );
+    // outcome_c ... outcome_j: optional extra outcomes (up to LIMITS.maxOutcomes in total).
+    for (const letter of OUTCOME_OPTION_LETTERS.slice(2)) {
+      s.addStringOption((o) =>
+        o.setName(`outcome_${letter}`).setDescription('Optional extra outcome').setMaxLength(LIMITS.outcomeMax),
+      );
+    }
+    return s;
+  })
   .addSubcommand((s) =>
     s
       .setName('list')
@@ -78,12 +87,11 @@ async function execute(ctx, interaction) {
     case 'create': {
       const input = {
         question: interaction.options.getString('question'),
-        outcomeA: interaction.options.getString('outcome_a'),
-        outcomeB: interaction.options.getString('outcome_b'),
+        outcomes: OUTCOME_OPTION_LETTERS.map((l) => interaction.options.getString(`outcome_${l}`)).filter((o) => o?.trim()),
         duration: interaction.options.getString('duration'),
         description: interaction.options.getString('description'),
       };
-      if (input.question && input.outcomeA && input.outcomeB && input.duration) {
+      if (input.question && input.outcomes.length >= LIMITS.minOutcomes && input.duration) {
         return flows.createMarket(ctx, interaction, input);
       }
       return interaction.showModal(flows.createModal(input));
@@ -103,11 +111,13 @@ async function execute(ctx, interaction) {
     case 'view': {
       const market = services.markets.requireMarket(interaction.options.getInteger('market_id'));
       const now = services.clock();
-      const embed = views.marketEmbed(market, { now });
+      const settlement = market.status === 'RESOLVED' ? services.settlement.getSettlement(market.id) : null;
+      const embed = views.marketEmbed(market, { now, settlement });
       embed.addFields({ name: 'Your bets', value: truncate(flows.positionText(ctx, market, interaction.user.id), 1024) });
-      const components = views.marketComponents(market, { now });
-      const link = flows.marketLinkRow(ctx, market);
-      if (link) components.push(link);
+      const linkUrl = market.announcement_message_id
+        ? views.messageLink(ctx.config.guildId, market.announcement_channel_id, market.announcement_message_id)
+        : null;
+      const components = views.marketComponents(market, { now, settlement, linkUrl });
       return respond(interaction, { embeds: [embed], components });
     }
 

@@ -22,6 +22,7 @@ function fakeDiscord() {
   const sent = { [BETTING]: [], [ANNOUNCE]: [] };
   const edits = [];
   const dms = [];
+  const closedDms = new Set();
   const guild = {
     id: GUILD,
     name: 'Test server',
@@ -56,10 +57,16 @@ function fakeDiscord() {
     channels: { fetch: async (id) => channels[id] ?? null },
     guilds: { cache: new Map([[GUILD, guild]]), fetch: async () => guild },
     users: {
-      fetch: async (id) => ({ id, send: async (payload) => dms.push({ id, payload }) }),
+      fetch: async (id) => ({
+        id,
+        send: async (payload) => {
+          if (closedDms.has(id)) throw Object.assign(new Error('Cannot send messages to this user'), { code: 50007 });
+          dms.push({ id, payload });
+        },
+      }),
     },
   };
-  return { client, sent, edits, dms };
+  return { client, sent, edits, dms, closedDms };
 }
 
 class FakeInteraction {
@@ -170,13 +177,13 @@ test('/market create without options opens the creation modal; submitting it cre
   const i = await h.run({ kind: 'command', commandName: 'market', sub: 'create', user: uid(1), options: {} });
   assert.equal(i.last()[0], 'showModal');
   assert.equal(i.last()[1].custom_id, ids.createModal());
-  assert.equal(i.last()[1].components.length, 5);
+  assert.equal(i.last()[1].components.length, 4, 'question, outcomes, duration, description');
 
   const submit = await h.run({
     kind: 'modal',
     user: uid(1),
     customId: ids.createModal(),
-    fields: { question: 'Modal market question?', outcome_a: 'Up', outcome_b: 'Down', duration: '2d', description: '' },
+    fields: { question: 'Modal market question?', outcomes: 'Up\nDown', duration: '2d', description: '' },
   });
   assert.match(submit.text(), /Market #1 created/);
   assert.equal(h.sent[ANNOUNCE].length, 1);
@@ -185,7 +192,7 @@ test('/market create without options opens the creation modal; submitting it cre
     kind: 'modal',
     user: uid(1),
     customId: ids.createModal(),
-    fields: { question: 'Another market?', outcome_a: 'A', outcome_b: 'B', duration: 'forever' },
+    fields: { question: 'Another market?', outcomes: 'A\nB', duration: 'forever' },
   });
   assert.match(bad.text(), /Invalid duration/);
 });
@@ -360,4 +367,347 @@ test('unexpected errors are reported generically without leaking details', async
   const i = await h.run({ kind: 'command', commandName: 'profile' });
   assert.match(i.text(), /Something went wrong on our side/);
   assert.doesNotMatch(i.text(), /secret/);
+});
+
+/* ---------------------------------------------------------------------------
+ * Resolving with buttons + per-bettor results on the market message
+ * ------------------------------------------------------------------------- */
+
+const embedText = (payload) => JSON.stringify(json(payload.embeds[0]));
+const lastMarketEdit = (h) => h.edits.at(-1).payload;
+const resolveButtons = (payload) =>
+  (payload.components ?? []).flatMap((r) => json(r).components).filter((b) => b.custom_id.startsWith('pm:res:'));
+
+async function closedMarketWithBets(h) {
+  await h.run(createCmd());
+  await h.run({ kind: 'command', commandName: 'market', sub: 'bet', user: uid(2), options: { market_id: 1, outcome: 'YES', amount: 100 } });
+  await h.run({ kind: 'command', commandName: 'market', sub: 'bet', user: uid(3), options: { market_id: 1, outcome: 'YES', amount: 300 } });
+  await h.run({ kind: 'command', commandName: 'market', sub: 'bet', user: uid(4), options: { market_id: 1, outcome: 'NO', amount: 200 } });
+  assert.equal(resolveButtons(lastMarketEdit(h)).length, 0, 'no resolve buttons while betting is open');
+  h.advance(HOUR);
+  h.services.markets.closeExpiredMarkets();
+  await h.publisher.syncAll();
+}
+
+test('after betting closes the market message offers one resolve button per outcome', async () => {
+  const h = harness();
+  await closedMarketWithBets(h);
+  const buttons = resolveButtons(lastMarketEdit(h));
+  assert.deepEqual(buttons.map((b) => b.custom_id), [ids.resolve(1, 0), ids.resolve(1, 1)]);
+  assert.deepEqual(buttons.map((b) => b.label), ['Resolve: YES', 'Resolve: NO']);
+  assert.match(embedText(lastMarketEdit(h)), /pick the result with the buttons below/);
+});
+
+test('the creator resolves with a button; every bettor sees their result on the market message', async () => {
+  const h = harness();
+  await closedMarketWithBets(h);
+
+  const stranger = await h.run({ kind: 'button', channelId: ANNOUNCE, user: uid(2), customId: ids.resolve(1, 0) });
+  assert.match(stranger.text(), /Only the market creator/);
+  assert.equal(h.services.markets.getMarket(1).status, 'AWAITING_RESOLUTION');
+
+  const click = await h.run({ kind: 'button', channelId: ANNOUNCE, user: uid(1), customId: ids.resolve(1, 0) });
+  assert.match(click.text(), /Winning outcome: \*\*YES\*\*/);
+  assert.match(click.text(), /This is final/);
+  assert.equal(h.services.markets.getMarket(1).status, 'AWAITING_RESOLUTION', 'nothing happens before confirming');
+
+  const confirm = await h.run({ kind: 'button', channelId: ANNOUNCE, user: uid(1), customId: click.components()[0].custom_id });
+  assert.match(confirm.text(), /resolved/);
+  assert.equal(h.services.markets.getMarket(1).status, 'RESOLVED');
+
+  // YES pool 400, NO pool 200: uid2 100 -> 150 (+50), uid3 300 -> 450 (+150), uid4 loses 200.
+  const payload = lastMarketEdit(h);
+  const embed = json(payload.embeds[0]);
+  const results = embed.fields.filter((f) => f.name.startsWith('Results'));
+  assert.equal(results[0].name, 'Results · 2 won, 1 lost');
+  const lines = results.flatMap((f) => f.value.split('\n'));
+  assert.deepEqual(lines, [
+    `✅ <@${uid(3)}> won **+150 pts** (staked 300 pts, paid 450 pts)`,
+    `✅ <@${uid(2)}> won **+50 pts** (staked 100 pts, paid 150 pts)`,
+    `❌ <@${uid(4)}> lost **200 pts**`,
+  ]);
+  assert.equal(resolveButtons(payload).length, 0, 'resolve buttons removed after resolution');
+  assert.deepEqual(payload.allowedMentions, { parse: [] }, 'listing bettors does not ping them');
+
+  // A stale resolve button cannot settle twice.
+  const again = await h.run({ kind: 'button', channelId: ANNOUNCE, user: uid(1), customId: ids.resolve(1, 1) });
+  assert.match(again.text(), /already resolved/);
+  assert.equal(balance(h.services, uid(3)), 1150);
+  assertLedgerConsistent(assert, h.db);
+});
+
+test('an administrator resolves with a button after giving a reason', async () => {
+  const h = harness();
+  await closedMarketWithBets(h);
+  const admin = { channelId: ANNOUNCE, user: uid(9), admin: true };
+
+  const click = await h.run({ ...admin, kind: 'button', customId: ids.resolve(1, 1) });
+  assert.equal(click.last()[0], 'showModal');
+  assert.equal(click.last()[1].custom_id, ids.resolveModal(1, 1));
+
+  const notAdmin = await h.run({ kind: 'modal', channelId: ANNOUNCE, user: uid(2), customId: ids.resolveModal(1, 1), fields: { reason: 'sneaky' } });
+  assert.match(notAdmin.text(), /Administrator permission/);
+
+  const modal = await h.run({ ...admin, kind: 'modal', customId: ids.resolveModal(1, 1), fields: { reason: 'Creator left; checked source' } });
+  assert.match(modal.text(), /Administrator resolution/);
+  assert.match(modal.text(), /Creator left; checked source/);
+  const confirm = await h.run({ ...admin, kind: 'button', customId: modal.components()[0].custom_id });
+  assert.match(confirm.text(), /resolved/);
+
+  const market = h.services.markets.getMarket(1);
+  assert.equal(market.winning_outcome, 1);
+  assert.equal(market.resolved_by_admin, 1);
+  const log = h.db.prepare("SELECT reason FROM audit_logs WHERE action = 'ADMIN_MARKET_RESOLVE'").get();
+  assert.equal(log.reason, 'Creator left; checked source');
+  // NO pool 200 wins the YES pool 400: uid4 gets 600 back.
+  assert.match(embedText(lastMarketEdit(h)), /won \*\*\+400 pts\*\*/);
+  assert.equal(balance(h.services, uid(4)), 1400);
+});
+
+test('resolve buttons cannot be used before the deadline, even if forged', async () => {
+  const h = harness();
+  await h.run(createCmd());
+  const creator = await h.run({ kind: 'button', channelId: ANNOUNCE, user: uid(1), customId: ids.resolve(1, 0) });
+  assert.match(creator.text(), /still open/);
+  const admin = await h.run({ kind: 'button', channelId: ANNOUNCE, user: uid(9), admin: true, customId: ids.resolve(1, 0) });
+  assert.match(admin.text(), /still open/);
+  assert.notEqual(admin.last()[0], 'showModal');
+});
+
+test('refunds and no-bet markets are described in the results', async () => {
+  const views = require('../src/discord/views');
+  const refund = views.resultFields({ refunded: 1, payouts: [{ user_id: uid(2), staked: 100, paid: 100 }] });
+  assert.equal(refund[0].name, 'Results · all 1 bettor refunded');
+  assert.equal(refund[0].value, `↩️ <@${uid(2)}> refunded 100 pts`);
+  const none = views.resultFields({ refunded: 0, payouts: [] });
+  assert.match(none[0].value, /No bets were placed/);
+  const mixed = views.resultFields({ refunded: 0, payouts: [{ user_id: uid(2), staked: 300, paid: 200 }] });
+  assert.equal(mixed[0].value, `❌ <@${uid(2)}> lost **100 pts** (staked 300 pts, got 200 pts back)`);
+});
+
+test('results are paginated: page 1 on the market message, private pageable copy via "All results"', async () => {
+  const h = harness();
+  await h.run(createCmd());
+  // 25 bettors: 13 on YES, 12 on NO -> 3 pages of 10.
+  for (let n = 10; n < 35; n++) {
+    await h.run({ kind: 'command', commandName: 'market', sub: 'bet', user: uid(n), options: { market_id: 1, outcome: n % 2 ? 'NO' : 'YES', amount: 10 + n } });
+  }
+  h.advance(HOUR);
+  const click = await h.run({ kind: 'button', channelId: ANNOUNCE, user: uid(1), customId: ids.resolve(1, 0) });
+  await h.run({ kind: 'button', channelId: ANNOUNCE, user: uid(1), customId: click.components()[0].custom_id });
+
+  // Shared market message: only page 1, plus an "All results" button.
+  const payload = lastMarketEdit(h);
+  const embed = json(payload.embeds[0]);
+  const results = embed.fields.filter((f) => f.name.startsWith('Results'));
+  assert.equal(results.length, 1);
+  assert.equal(results[0].name, 'Results · 13 won, 12 lost (page 1/3)');
+  assert.equal(results[0].value.split('\n').filter((l) => /^[✅❌]/.test(l)).length, 10);
+  assert.match(results[0].value, /Showing 10 of 25/);
+  const allButton = payload.components.flatMap((r) => json(r).components).find((b) => b.custom_id === ids.results(1));
+  assert.equal(allButton.label, 'All results (25)');
+
+  // Clicking it opens a private copy (ephemeral reply), page 1, with the viewer's own result pinned.
+  const viewer = uid(33); // a NO bettor: lost
+  const open = await h.run({ kind: 'button', channelId: ANNOUNCE, user: viewer, customId: ids.results(1) });
+  assert.equal(open.last()[0], 'reply');
+  assert.ok(open.last()[1].flags, 'ephemeral');
+  assert.match(open.text(), new RegExp(`Your result:\\*\\* ❌ <@${viewer}> lost`));
+  assert.match(open.text(), /Page 1\/3 · 25 bettors/);
+  const next = open.components().find((b) => b.label === 'Next ▶');
+  assert.equal(next.custom_id, ids.resultsPage(1, 2));
+
+  // Paging updates only that private message; the shared message is untouched.
+  const editsBefore = h.edits.length;
+  const seen = new Set();
+  for (let page = 1; page <= 3; page++) {
+    const i = await h.run({ kind: 'button', channelId: ANNOUNCE, user: viewer, customId: ids.resultsPage(1, page) });
+    assert.equal(i.last()[0], 'update');
+    assert.match(i.text(), new RegExp(`Page ${page}/3`));
+    const lines = json(i.last()[1].embeds[0]).description.split('\n\n').at(-1).split('\n');
+    assert.equal(lines.length, page < 3 ? 10 : 5);
+    for (const l of lines) seen.add(l.match(/<@(\d+)>/)[1]);
+  }
+  assert.equal(seen.size, 25, 'every bettor appears exactly once across pages');
+  assert.equal(h.edits.length, editsBefore);
+
+  // Out-of-range pages are clamped; unresolved markets have no results.
+  const far = await h.run({ kind: 'button', channelId: ANNOUNCE, user: viewer, customId: ids.resultsPage(1, 99) });
+  assert.match(far.text(), /Page 3\/3/);
+  await h.run(createCmd({ question: 'Another open market?' }));
+  const early = await h.run({ kind: 'button', channelId: ANNOUNCE, user: viewer, customId: ids.results(2) });
+  assert.match(early.text(), /no results yet/);
+
+  // /market view shows page 1 and the same button.
+  const view = await h.run({ kind: 'command', commandName: 'market', sub: 'view', user: viewer, options: { market_id: 1 } });
+  assert.match(view.text(), /page 1\/3/);
+  assert.ok(view.components().some((b) => b.custom_id === ids.results(1)));
+});
+
+test('small markets show all results on the message without an "All results" button', async () => {
+  const h = harness();
+  await closedMarketWithBets(h);
+  const click = await h.run({ kind: 'button', channelId: ANNOUNCE, user: uid(1), customId: ids.resolve(1, 0) });
+  await h.run({ kind: 'button', channelId: ANNOUNCE, user: uid(1), customId: click.components()[0].custom_id });
+  const payload = lastMarketEdit(h);
+  assert.doesNotMatch(embedText(payload), /page 1\//);
+  assert.ok(!payload.components.flatMap((r) => json(r).components).some((b) => b.custom_id === ids.results(1)));
+});
+
+test('a results page stays within Discord embed limits even with huge numbers', () => {
+  const views = require('../src/discord/views');
+  const payouts = Array.from({ length: 400 }, (_, i) => ({ user_id: uid(i + 1), staked: 999_999_999_999, paid: i % 2 ? 0 : 999_999_999_999 * 2 }));
+  const market = {
+    id: 1, question: 'Q'.repeat(200), description: 'D'.repeat(1000), status: 'RESOLVED', creator_id: uid(1),
+    created_at: 0, expires_at: 1, resolved_at: 2, resolver_id: uid(1), resolved_by_admin: 0, winning_outcome: 0,
+    outcomes: [{ idx: 0, label: 'Y'.repeat(50), pool: 1, bettors: 200, probability: 50, multiplier: 2 },
+               { idx: 1, label: 'N'.repeat(50), pool: 1, bettors: 200, probability: 50, multiplier: 2 }],
+    totalPool: 2, participants: 400,
+  };
+  const settlement = { refunded: 0, payouts };
+  const data = views.marketEmbed(market, { now: 3, settlement }).toJSON();
+  for (const f of data.fields) assert.ok(f.value.length <= 1024, `field ${f.name} is ${f.value.length} chars`);
+  const total = data.title.length + data.description.length + data.footer.text.length +
+    data.fields.reduce((a, f) => a + f.name.length + f.value.length, 0) + 'Your bets'.length + 1024;
+  assert.ok(total <= 6000, `embed is ${total} chars`);
+  const page = views.resultsView(market, settlement, 40, uid(2)).embeds[0].toJSON();
+  assert.ok(page.description.length <= 4096);
+  assert.match(page.footer.text, /Page 40\/40/);
+});
+
+test('every bettor gets a DM saying what they won or lost, exactly once', async () => {
+  const h = harness();
+  await closedMarketWithBets(h);
+  h.closedDms.add(uid(4)); // has DMs disabled
+  const dmsBefore = h.dms.length; // creator reminder
+
+  const click = await h.run({ kind: 'button', channelId: ANNOUNCE, user: uid(1), customId: ids.resolve(1, 0) });
+  await h.run({ kind: 'button', channelId: ANNOUNCE, user: uid(1), customId: click.components()[0].custom_id });
+
+  const results = h.dms.slice(dmsBefore).map((d) => ({ id: d.id, embed: json(d.payload.embeds[0]) }));
+  const byUser = Object.fromEntries(results.map((r) => [r.id, r.embed]));
+  assert.deepEqual(Object.keys(byUser).sort(), [uid(2), uid(3)], 'winners DMed; closed-DM loser skipped without error');
+  assert.equal(byUser[uid(2)].title, '✅ You won +50 pts!');
+  assert.match(byUser[uid(2)].description, /staked 100 pts and received \*\*150 pts\*\*/);
+  assert.match(byUser[uid(2)].description, /Your balance: \*\*1,050 pts\*\*/);
+  assert.match(byUser[uid(2)].description, /Your bets: 100 pts on \*\*YES\*\*/);
+  assert.equal(byUser[uid(3)].title, '✅ You won +150 pts!');
+  assert.equal(results.filter((r) => r.id === uid(1)).length, 0, 'the creator did not bet, so no result DM');
+
+  // The closed-DM notification is not retried forever and nothing is sent twice.
+  const pending = h.db.prepare("SELECT COUNT(*) FROM notifications WHERE kind = 'BET_RESULT' AND status <> 'SENT'").pluck().get();
+  assert.equal(pending, 0);
+  await h.notifier.dispatch();
+  assert.equal(h.dms.length, dmsBefore + 2);
+});
+
+test('losers and cancelled-market bettors get a DM with the amount', async () => {
+  const h = harness();
+  await closedMarketWithBets(h);
+  const before = h.dms.length;
+  const click = await h.run({ kind: 'button', channelId: ANNOUNCE, user: uid(1), customId: ids.resolve(1, 0) });
+  await h.run({ kind: 'button', channelId: ANNOUNCE, user: uid(1), customId: click.components()[0].custom_id });
+  const loser = h.dms.slice(before).find((d) => d.id === uid(4));
+  assert.equal(json(loser.payload.embeds[0]).title, '❌ You lost 200 pts');
+  assert.match(json(loser.payload.embeds[0]).description, /Result: \*\*YES\*\*\. You staked 200 pts and lost it\./);
+
+  const h2 = harness();
+  await h2.run(createCmd());
+  await h2.run({ kind: 'command', commandName: 'market', sub: 'bet', user: uid(2), options: { market_id: 1, outcome: 'YES', amount: 120 } });
+  const admin = { kind: 'command', commandName: 'admin', user: uid(9), admin: true };
+  const prep = await h2.run({ ...admin, group: 'market', sub: 'cancel', options: { market_id: 1, reason: 'Question was ambiguous' } });
+  await h2.run({ ...admin, kind: 'button', customId: prep.components()[0].custom_id });
+  const refund = json(h2.dms.find((d) => d.id === uid(2)).payload.embeds[0]);
+  assert.equal(refund.title, '↩️ Market #1 was cancelled');
+  assert.match(refund.description, /Question was ambiguous/);
+  assert.match(refund.description, /Your stake of 120 pts was refunded/);
+});
+
+/* ---------------------------------------------------------------------------
+ * More than two outcomes
+ * ------------------------------------------------------------------------- */
+
+const allButtons = (payload) => (payload.components ?? []).flatMap((r) => json(r).components);
+function assertLayout(payload) {
+  const rows = (payload.components ?? []).map(json);
+  assert.ok(rows.length <= 5, `${rows.length} rows`);
+  for (const r of rows) assert.ok(r.components.length >= 1 && r.components.length <= 5);
+  const customIds = allButtons(payload).map((b) => b.custom_id).filter(Boolean);
+  assert.equal(new Set(customIds).size, customIds.length, 'custom ids are unique');
+}
+
+test('the creation form takes one outcome per line', async () => {
+  const { parseOutcomeLines } = require('../src/handlers/interactionHandler');
+  assert.deepEqual(parseOutcomeLines('Home\r\n\n Draw \nAway\n'), ['Home', 'Draw', 'Away']);
+  const h = harness();
+  const ok = await h.run({
+    kind: 'modal', user: uid(1), customId: ids.createModal(),
+    fields: { question: 'Who wins the derby?', outcomes: 'Home\nDraw\n\nAway', duration: '1d' },
+  });
+  assert.match(ok.text(), /Market #1 created/);
+  assert.deepEqual(h.services.markets.getMarket(1).outcomes.map((o) => o.label), ['Home', 'Draw', 'Away']);
+  const tooMany = await h.run({
+    kind: 'modal', user: uid(1), customId: ids.createModal(),
+    fields: { question: 'Too many choices?', outcomes: Array.from({ length: 11 }, (_, i) => `O${i}`).join('\n'), duration: '1d' },
+  });
+  assert.match(tooMany.text(), /between 2 and 10 outcomes/);
+  const one = await h.run({
+    kind: 'modal', user: uid(1), customId: ids.createModal(),
+    fields: { question: 'Only one choice?', outcomes: 'Lonely', duration: '1d' },
+  });
+  assert.match(one.text(), /between 2 and 10 outcomes/);
+});
+
+test('/market create with outcome_c.. options; prefilled form when incomplete', async () => {
+  const h = harness();
+  const i = await h.run(createCmd({ outcome_a: 'Home', outcome_b: 'Draw', outcome_c: 'Away' }));
+  assert.match(i.text(), /Market #1 created/);
+  assert.deepEqual(h.services.markets.getMarket(1).outcomes.map((o) => o.label), ['Home', 'Draw', 'Away']);
+  // 3 bet buttons + My position share one row.
+  const payload = h.sent[ANNOUNCE][0].payload;
+  assert.equal(payload.components.length, 1);
+  assert.deepEqual(allButtons(payload).map((b) => b.label), ['Bet: Home', 'Bet: Draw', 'Bet: Away', 'My position']);
+
+  // Only outcome_a given: the form opens prefilled.
+  const partial = await h.run({ kind: 'command', commandName: 'market', sub: 'create', user: uid(1), options: { question: 'Prefill?', outcome_a: 'Yes' } });
+  assert.equal(partial.last()[0], 'showModal');
+  const outcomesInput = partial.last()[1].components[1].component;
+  assert.equal(outcomesInput.custom_id, 'outcomes');
+  assert.equal(outcomesInput.value, 'Yes');
+});
+
+test('a 10-outcome market fits Discord limits in every state and resolves via button', async () => {
+  const h = harness();
+  const options = { question: 'Which of ten wins?' };
+  'abcdefghij'.split('').forEach((l, i) => (options[`outcome_${l}`] = `Option ${i + 1}`));
+  await h.run(createCmd(options));
+  const opened = h.sent[ANNOUNCE][0].payload;
+  assertLayout(opened);
+  assert.equal(allButtons(opened).filter((b) => b.custom_id.startsWith('pm:bet:')).length, 10);
+  const embed = json(opened.embeds[0]);
+  assert.ok(embed.fields.length <= 25);
+  assert.equal(embed.fields.filter((f) => /Option \d+/.test(f.name)).length, 10);
+
+  await h.run({ kind: 'command', commandName: 'market', sub: 'bet', user: uid(2), options: { market_id: 1, outcome: 'Option 7', amount: 100 } });
+  await h.run({ kind: 'command', commandName: 'market', sub: 'bet', user: uid(3), options: { market_id: 1, outcome: 'Option 9', amount: 300 } });
+  const view = await h.run({ kind: 'command', commandName: 'market', sub: 'view', user: uid(2), options: { market_id: 1 } });
+  assertLayout(view.last()[1]);
+  assert.ok(allButtons(view.last()[1]).some((b) => b.label === 'Open announcement'));
+
+  h.advance(HOUR);
+  h.services.markets.closeExpiredMarkets();
+  await h.publisher.syncAll();
+  const closed = lastMarketEdit(h);
+  assertLayout(closed);
+  assert.equal(closed.components.length, 5, '2 bet rows + utility row + 2 resolve rows');
+  assert.equal(resolveButtons(closed).length, 10);
+
+  const click = await h.run({ kind: 'button', channelId: ANNOUNCE, user: uid(1), customId: ids.resolve(1, 6) });
+  assert.match(click.text(), /Winning outcome: \*\*Option 7\*\*/);
+  await h.run({ kind: 'button', channelId: ANNOUNCE, user: uid(1), customId: click.components()[0].custom_id });
+  assert.equal(balance(h.services, uid(2)), 900 + 400);
+  const resolved = lastMarketEdit(h);
+  assertLayout(resolved);
+  assert.match(embedText(resolved), /Option 7 — winner/);
+  assertLedgerConsistent(assert, h.db);
 });

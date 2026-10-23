@@ -47,8 +47,13 @@ function createModal(prefill = {}) {
         placeholder: 'Will Bitcoin exceed $120,000 by December 31?',
         value: prefill.question,
       }),
-      input('outcome_a', 'Outcome A', { max: LIMITS.outcomeMax, placeholder: 'YES', value: prefill.outcomeA }),
-      input('outcome_b', 'Outcome B', { max: LIMITS.outcomeMax, placeholder: 'NO', value: prefill.outcomeB }),
+      input('outcomes', `Outcomes (one per line, ${LIMITS.minOutcomes}-${LIMITS.maxOutcomes})`, {
+        style: TextInputStyle.Paragraph,
+        max: LIMITS.maxOutcomes * (LIMITS.outcomeMax + 1),
+        min: 3,
+        placeholder: 'YES\nNO',
+        value: prefill.outcomes?.filter(Boolean).join('\n'),
+      }),
       input('duration', 'Betting window (30m, 6h, 2d, 7d…)', { max: 12, placeholder: '7d', value: prefill.duration }),
       input('description', 'Description / resolution criteria (optional)', {
         style: TextInputStyle.Paragraph,
@@ -74,7 +79,7 @@ async function createMarket(ctx, interaction, input) {
     creatorId: interaction.user.id,
     creatorName: nameOf(interaction),
     question: input.question,
-    outcomes: [input.outcomeA, input.outcomeB],
+    outcomes: input.outcomes,
     duration: input.duration,
     description: input.description,
     creationKey: `create:${interaction.id}`,
@@ -271,6 +276,45 @@ async function prepareResolve(ctx, interaction, { marketId, outcome, admin = fal
   });
 }
 
+/**
+ * "Resolve: <outcome>" button on the market message. The creator goes straight to
+ * the confirmation; an administrator (who is not the creator) is first asked for
+ * the mandatory reason. Everyone else is turned away.
+ */
+async function resolveButton(ctx, interaction, marketId, outcomeIdx) {
+  const { services } = ctx;
+  const market = services.markets.requireMarket(marketId);
+  if (!market.outcomes[outcomeIdx]) throw new UserError('This button is outdated.');
+  if (market.status === 'RESOLVED' || market.status === 'CANCELLED') {
+    ctx.publisher.sync(market.id); // the message is stale; refresh it
+  }
+  if (interaction.user.id === market.creator_id) {
+    return prepareResolve(ctx, interaction, { marketId: market.id, outcome: outcomeIdx });
+  }
+  if (!isAdmin(interaction)) {
+    throw new UserError(`Only the market creator (<@${market.creator_id}>) or an administrator can resolve this market.`);
+  }
+  // Validate before asking for a reason so the admin is not asked for nothing.
+  services.settlement.validateResolution(market, { outcome: outcomeIdx, actorId: interaction.user.id, isAdmin: true });
+  const reason = new TextInputBuilder()
+    .setCustomId('reason')
+    .setStyle(TextInputStyle.Paragraph)
+    .setRequired(true)
+    .setMinLength(3)
+    .setMaxLength(500)
+    .setPlaceholder('e.g. Creator left the server; result confirmed via official source.');
+  const modal = new ModalBuilder()
+    .setCustomId(ids.resolveModal(market.id, outcomeIdx))
+    .setTitle(truncate(`Admin resolve #${market.id}: ${market.outcomes[outcomeIdx].label}`, 45))
+    .addLabelComponents(
+      new LabelBuilder()
+        .setLabel('Reason (stored in the audit log)')
+        .setDescription(truncate(`You are resolving on behalf of the creator: ${market.question}`, 100))
+        .setTextInputComponent(reason),
+    );
+  return interaction.showModal(modal);
+}
+
 async function prepareCancel(ctx, interaction, { marketId, reason }) {
   const { services } = ctx;
   const market = services.markets.requireMarket(marketId);
@@ -380,15 +424,17 @@ async function handleAbort(ctx, interaction, confirmationId) {
   await interaction.update({ embeds: [views.infoEmbed('Cancelled', 'Nothing was changed.', views.COLORS.CANCELLED)], components: [] });
 }
 
-/** Link button to a market's announcement message, if it exists. */
-function marketLinkRow(ctx, market) {
-  if (!market.announcement_message_id) return null;
-  return new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setStyle(ButtonStyle.Link)
-      .setLabel('Open announcement')
-      .setURL(views.messageLink(ctx.config.guildId, market.announcement_channel_id, market.announcement_message_id)),
-  );
+/**
+ * "All results" (opens a private copy) and its page buttons (flip that private copy).
+ * Each viewer pages independently; the shared market message never changes.
+ */
+async function showResults(ctx, interaction, marketId, page, { flip = false } = {}) {
+  const market = ctx.services.markets.requireMarket(marketId);
+  const settlement = market.status === 'RESOLVED' ? ctx.services.settlement.getSettlement(market.id) : null;
+  if (!settlement) throw new UserError(`Market #${market.id} has no results yet.`);
+  const view = views.resultsView(market, settlement, page, interaction.user.id);
+  if (flip) return interaction.update({ ...view, allowedMentions: { parse: [] } });
+  return respond(interaction, view);
 }
 
 module.exports = {
@@ -400,9 +446,10 @@ module.exports = {
   positionText,
   showPosition,
   prepareResolve,
+  resolveButton,
+  showResults,
   prepareCancel,
   handleConfirm,
   handleAbort,
-  marketLinkRow,
   isAdmin,
 };

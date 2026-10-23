@@ -17,9 +17,9 @@ const LIMITS = Object.freeze({
   questionMax: 200,
   outcomeMax: 50,
   descriptionMax: 1000,
-  // The schema and services handle N outcomes; the product currently allows exactly two.
+  // 10 is the most that fits Discord's 5 rows x 5 buttons alongside the resolve buttons.
   minOutcomes: 2,
-  maxOutcomes: 2,
+  maxOutcomes: 10,
   duplicateWindowMs: 2 * 60_000,
 });
 
@@ -89,7 +89,7 @@ class MarketService {
       throw new UserError(`The question must be ${LIMITS.questionMin}-${LIMITS.questionMax} characters long.`);
     }
     if (labels.length < LIMITS.minOutcomes || labels.length > LIMITS.maxOutcomes) {
-      throw new UserError(`Markets need exactly ${LIMITS.maxOutcomes} outcomes.`);
+      throw new UserError(`Markets need between ${LIMITS.minOutcomes} and ${LIMITS.maxOutcomes} outcomes.`);
     }
     for (const label of labels) {
       if (!label || label.length > LIMITS.outcomeMax || label.includes('\n')) {

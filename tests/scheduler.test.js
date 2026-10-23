@@ -72,7 +72,12 @@ test('recovery after a simulated restart: expired markets close, creators notifi
   // The creator can still resolve after the restart.
   env.services.settlement.resolveMarket({ marketId: m.id, outcome: 'YES', actorId: uid(1) });
   await scheduler.tickMarkets();
-  assert.deepEqual(notifier.delivered, [`MARKET_EXPIRED:${m.id}`, `MARKET_RESOLVED:${m.id}`]);
+  assert.deepEqual(notifier.delivered, [
+    `MARKET_EXPIRED:${m.id}`,
+    `MARKET_RESOLVED:${m.id}`,
+    `BET_RESULT:${m.id}`, // one result DM per bettor (uid 2 and uid 3)
+    `BET_RESULT:${m.id}`,
+  ]);
   assert.equal(balance(env.services, uid(2)), 900 + 600 + 200);
   assertLedgerConsistent(assert, env.db);
   await scheduler.stop();

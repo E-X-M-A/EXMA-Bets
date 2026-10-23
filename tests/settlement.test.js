@@ -246,3 +246,38 @@ test('a failure mid-settlement rolls back everything', () => {
   assert.equal(balance(services, uid(2)), 900 + 150);
   assertLedgerConsistent(assert, db);
 });
+
+test('more than two outcomes: winners share all losing pools', () => {
+  // Pools: A 300, B 200 (two bets of 100), C 500. B wins; losing pools total 800.
+  const r = computeSettlement(mkBets([[0, 300], [1, 100], [1, 100], [2, 500]]), 1, 3);
+  assert.deepEqual(r.pools, [300, 200, 500]);
+  assert.deepEqual(r.results.map((x) => [x.status, x.payout]), [['LOST', 0], ['WON', 500], ['WON', 500], ['LOST', 0]]);
+  assert.equal(sumPayout(r), 1000);
+  assert.deepEqual(marketStats([300, 200, 500]).map((s) => s.probability), [30, 20, 50]);
+  assert.deepEqual(marketStats([0, 0, 0]).map((s) => s.probability), [33.3, 33.3, 33.3]);
+  // Nobody on the winning outcome (of three): everyone refunded.
+  const refund = computeSettlement(mkBets([[0, 100], [2, 50]]), 1, 3);
+  assert.equal(refund.mode, 'REFUND');
+  assert.equal(sumPayout(refund), 150);
+});
+
+test('end-to-end resolution of a multi-outcome market', () => {
+  const { services, db, advance } = setup();
+  const m = services.markets.createMarket({
+    creatorId: uid(1), question: 'Who wins the derby?', outcomes: ['Home', 'Draw', 'Away'], duration: '1h', creationKey: 'derby',
+  }).market;
+  bet(services, m.id, uid(2), 'Home', 300);
+  bet(services, m.id, uid(3), 'draw', 100);
+  bet(services, m.id, uid(4), 'C', 200); // letter C = third outcome
+  bet(services, m.id, uid(5), 2, 100);
+  assert.deepEqual(services.markets.getMarket(m.id).outcomes.map((o) => o.pool), [300, 100, 300]);
+  advance(HOUR);
+  const s = services.settlement.resolveMarket({ marketId: m.id, outcome: 'Away', actorId: uid(1) });
+  assert.equal(s.winnerCount, 2);
+  // Away pool 300 wins 400 from Home + Draw: uid4 200 -> 466.67, uid5 100 -> 233.33
+  assert.equal(balance(services, uid(4)), 800 + 467);
+  assert.equal(balance(services, uid(5)), 900 + 233);
+  assert.equal(balance(services, uid(2)), 700);
+  assert.equal(balance(services, uid(3)), 900);
+  assertLedgerConsistent(assert, db);
+});

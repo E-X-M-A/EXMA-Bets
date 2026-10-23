@@ -105,6 +105,7 @@ class SettlementService {
         metadata: { winningOutcome, label: market.outcomes[winningOutcome].label, mode: result.mode, pools: result.pools },
       });
       this.outbox.enqueue(`resolved:${market.id}`, 'MARKET_RESOLVED', market.id);
+      this.enqueueBettorResults(market.id);
       return { ...summary, market: this.markets.getMarket(market.id) };
     });
   }
@@ -141,6 +142,7 @@ class SettlementService {
         metadata: { refunded: summary.totalPaid, bets: bets.length, previousStatus: market.status },
       });
       this.outbox.enqueue(`cancelled:${market.id}`, 'MARKET_CANCELLED', market.id);
+      this.enqueueBettorResults(market.id);
       return { ...summary, market: this.markets.getMarket(market.id) };
     });
   }
@@ -188,6 +190,13 @@ class SettlementService {
       this.stmts.insertPayout.run(market.id, r.userId, r.stake, r.payout);
     }
     return { mode: result.mode, pools: result.pools, totalPool: result.totalPool, totalPaid, winnerCount: winners.size };
+  }
+
+  /** Queues one result DM per bettor (deduplicated per market and user). Must run inside the settlement tx. */
+  enqueueBettorResults(marketId) {
+    for (const p of this.stmts.payouts.all(marketId)) {
+      this.outbox.enqueue(`result:${marketId}:${p.user_id}`, 'BET_RESULT', marketId, { userId: p.user_id });
+    }
   }
 
   getSettlement(marketId) {

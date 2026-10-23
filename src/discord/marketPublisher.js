@@ -51,7 +51,8 @@ class MarketPublisher {
     const market = this.services.markets.getMarket(marketId);
     if (!market || market.synced_version >= market.sync_version) return;
     const version = market.sync_version;
-    const payload = marketMessage(market, { now: this.services.clock() });
+    const settlement = market.status === 'RESOLVED' ? this.services.settlement.getSettlement(market.id) : null;
+    const payload = marketMessage(market, { now: this.services.clock(), settlement });
 
     if (market.announcement_message_id) {
       const { channel, problem } = await getPostableChannel(this.client, this.config.guildId, market.announcement_channel_id);

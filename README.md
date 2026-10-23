@@ -5,7 +5,7 @@ EXMA Bets is a Polymarket-style prediction market for a single Discord server. M
 - Node.js (≥ 22) · discord.js v14 · SQLite via better-sqlite3
 - Slash commands, embeds, buttons, modals and autocomplete
 - Every member gets 1,000 points to start and **200 points automatically every day at 00:00 Europe/Berlin**. Nobody has to claim anything.
-- Transactional, idempotent ledger. Restart-safe scheduler. 75 automated tests.
+- Transactional, idempotent ledger. Restart-safe scheduler. 90 automated tests.
 
 ---
 
@@ -83,13 +83,15 @@ All configuration comes from environment variables, usually set in `.env`. Start
 
 ### Markets
 
-1. `/market create`: pass the options directly, or leave them empty to get a form. A market has a question, two outcomes, a duration (`30m`, `6h`, `2d`, `7d`, `1d12h`; between 5 minutes and 90 days) and an optional description or resolution criteria.
+1. `/market create`: pass the options directly, or leave them empty to get a form. A market has a question, **2 to 10 outcomes**, a duration (`30m`, `6h`, `2d`, `7d`, `1d12h`; between 5 minutes and 90 days) and an optional description or resolution criteria.
 2. The market is published in the announcement channel with one **Bet** button per outcome and a **My position** button. Every bet updates the embed: pools, participants, implied probabilities and estimated payout multipliers.
 3. At the deadline, betting stops. Bets are rejected by timestamp even if the scheduler hasn't run yet. The market moves to `AWAITING_RESOLUTION`, the buttons are disabled, and the creator gets a DM. If DMs are closed, the creator is pinged in the betting channel instead.
-4. The creator runs `/market resolve market_id:<id> outcome:<outcome>` and confirms with a button. Payouts happen immediately and the result is posted in the announcement channel.
-5. Administrators can **cancel** any unresolved market, which refunds every stake. They can also **resolve** an expired market for an unavailable creator. Both require a reason and are written to `audit_logs`.
+4. The market message gets one **🏁 Resolve: <outcome>** button per outcome. The creator presses the button for the real result and confirms. (`/market resolve market_id:<id> outcome:<outcome>` does the same.) An administrator can also press a resolve button: they are first asked for a reason, which goes into the audit log. Anyone else is told only the creator or an admin can resolve. Payouts happen immediately and the result is posted in the announcement channel.
+5. The market message is edited to show a **Results** section listing every bettor and what they won or lost, for example `✅ @alice won +150 pts (staked 300 pts, paid 450 pts)` or `❌ @bob lost 200 pts`. Mentions inside the embed don't ping anyone. Results are paginated, 10 bettors per page, best result first. The market message shows page 1. If there are more, an **📄 All results** button opens a private copy that only the clicker sees: their own result is pinned at the top and they can page through everyone with ◀ / ▶ without changing the shared message.
+6. Every bettor also gets a **DM** with their result: won/lost/refunded amount, their bets and their new balance. Each DM is queued once per bettor in the same transaction as the payout, so restarts never send duplicates. Members with DMs closed are skipped; their result is still on the market message.
+7. Administrators can **cancel** any unresolved market, which refunds every stake; each bettor is DMed about the refund. They can also **resolve** an expired market for an unavailable creator, using the resolve buttons or `/admin market resolve`. Both require a reason and are written to `audit_logs`.
 
-Markets currently have exactly two outcomes. Outcomes are stored in a separate `market_outcomes` table, and the settlement math, embeds and buttons all handle N outcomes. Supporting more only requires raising `LIMITS.maxOutcomes` and adding form fields.
+Markets can have 2 to 10 outcomes (yes/no, or e.g. Home / Draw / Away). In the creation form, enter one outcome per line. With `/market create`, use `outcome_a` and `outcome_b`, plus the optional `outcome_c` … `outcome_j`; if the required options are incomplete, the form opens prefilled. The market message gets one Bet button and, once betting closes, one Resolve button per outcome, laid out within Discord's limit of 5 rows of 5 buttons. Ten is the most that fits. Outcomes can also be given by letter (`A`, `B`, `C`, …) in `/market bet` and `/market resolve`.
 
 ### Betting flow
 
@@ -97,16 +99,16 @@ Click **Bet: YES** → enter a stake in the modal (a number, `1,000` or `max`) �
 
 The stake is deducted and the bet inserted in one transaction. The confirmation is single-use and belongs to you, so a double click or retried interaction can never charge twice. `/market bet` places a bet directly, keyed by the interaction ID.
 
-Rules: minimum `MIN_BET`, maximum your balance. You can place as many bets as you like, on either outcome. Placed bets are final.
+Rules: minimum `MIN_BET`, maximum your balance. You can place as many bets as you like, on any outcome. Placed bets are final.
 
 ### Payouts (pari-mutuel)
 
 All stakes form one pool. When the market resolves:
 
-- **Winners** get their stake back **plus** a share of the losing pool proportional to their stake: `payout = stake + stake × losingPool / winningPool`.
+- **Winners** get their stake back **plus** a share of the losing pool proportional to their stake: `payout = stake + stake × losingPool / winningPool`. With more than two outcomes, the losing pool is all the other outcomes' pools combined. For example, with Home 300 / Draw 100 / Away 300, an Away win shares 400 points among the Away bettors.
 - **Losers** lose their stakes. The creator gets nothing for creating the market; they win only through their own bets.
 - **Nobody bet on the winning outcome:** everyone is refunded.
-- **Nobody bet on the losing outcome:** winners get exactly their stake back.
+- **Nobody bet on any losing outcome:** winners get exactly their stake back.
 - **No bets:** the market resolves and no points move.
 - **Rounding:** shares are rounded down to whole points. The leftover points (always fewer than the number of winning bets) go one each to the bets with the largest fractional remainder; ties go to the oldest bet. Total paid always equals the total pool, so no points are created or lost. This is enforced by a `CHECK` constraint and by tests.
 
@@ -120,11 +122,11 @@ All normal commands work only in `BETTING_CHANNEL_ID` (threads inside it are all
 
 | Command | Description |
 |---|---|
-| `/market create [question outcome_a outcome_b duration description]` | Create a market. With no options, a form opens. |
+| `/market create [question outcome_a outcome_b … outcome_j duration description]` | Create a market with 2-10 outcomes. With missing options, a (prefilled) form opens. |
 | `/market list [status] [page]` | Open / awaiting resolution / resolved / cancelled markets, with pagination |
 | `/market view market_id` | Full market details, your bets and bet buttons |
 | `/market bet market_id outcome amount` | Bet without the buttons |
-| `/market resolve market_id outcome` | Creator resolves their expired market (with a confirmation step) |
+| `/market resolve market_id outcome` | Creator resolves their expired market (with a confirmation step). Same as pressing a 🏁 Resolve button. |
 | `/market history [user]` | The 10 most recent bets with outcomes and payouts |
 | `/balance [user]` | Balance, rank and points at stake |
 | `/profile [user]` | Balance, total wagered, bets, winning bets, markets created/resolved, net P/L |
@@ -149,7 +151,7 @@ Every administrator action is recorded in the `audit_logs` table.
 
 - **Transactions everywhere money moves.** Bets, payouts, refunds, admin adjustments and daily rewards each run in a single `BEGIN IMMEDIATE` transaction. better-sqlite3 is synchronous, so a transaction can never interleave with another interaction. WAL mode with `busy_timeout` serializes writers across processes; a test hammers one account from 4 worker threads.
 - **Exactly-once settlement.** `settlements.market_id` is `UNIQUE`, each bet can move from `ACTIVE` only once, and each credit has a per-bet idempotency key (`payout:<betId>`, `refund:<betId>`). A crash mid-settlement rolls back completely.
-- **Outbox for Discord side effects.** Creator reminders and result announcements are queued in `notifications` inside the same transaction as the state change. Each one has a unique dedupe key, and failed deliveries are retried with backoff. Embed refreshes use `sync_version`/`synced_version`, so a Discord outage never undoes or blocks a committed transaction.
+- **Outbox for Discord side effects.** Creator reminders, result announcements and per-bettor result DMs are queued in `notifications` inside the same transaction as the state change. Each one has a unique dedupe key, and failed deliveries are retried with backoff. Embed refreshes use `sync_version`/`synced_version`, so a Discord outage never undoes or blocks a committed transaction.
 - **Startup reconciliation.** On start the bot closes expired markets, re-renders stale embeds, delivers pending notifications and pays missed daily rewards. If an announcement of an open market was deleted, it is reposted.
 - **Persistent buttons.** Custom IDs are stateless (`pm:bet:<market>:<outcome>`), so buttons keep working after a restart. Every click re-validates market state, expiry, outcome and balance. Outdated buttons get a short explanation.
 - **Validation.** All input is validated on the server side, all SQL uses prepared statements, `@everyone`/`@here` are neutralized, and bot messages are sent with mentions disabled except the intended creator ping.
@@ -184,20 +186,21 @@ data/                      runtime database (git-ignored)
 
 ## Tests
 
-`npm test` runs 75 tests with Node's built-in test runner. They cover:
+`npm test` runs 90 tests with Node's built-in test runner. They cover:
 
 - initial balances and ledger idempotency
 - the automatic daily distribution: once per day, crash/resume, missed-day catch-up, the backfill cap, DST boundaries, and that `/daily` does not exist
 - insufficient balance and the minimum bet
 - concurrent bets from multiple worker threads
 - bets after expiry
-- pari-mutuel payouts and rounding (500 randomized rounds)
+- pari-mutuel payouts and rounding (500 randomized rounds), including markets with 3 and 10 outcomes and their button layout
 - markets with no bets, with no winning-side bettors, and with one-sided pools
 - cancellation refunds, resolution permissions and duplicate settlement prevention
 - rollback on a crash mid-settlement
 - recovery after a simulated restart
 - channel restrictions and custom-ID tampering
 - config validation and secret redaction
-- an end-to-end run of the real interaction handler against fake Discord objects: create → publish → button → modal → confirm → embed refresh → expiry DM → resolve → announcement, plus admin commands
+- an end-to-end run of the real interaction handler against fake Discord objects: create → publish → button → modal → confirm → embed refresh → expiry DM → resolve via button (creator, and admin with reason) → per-bettor results in the embed → result DMs (including closed DMs) → announcement, plus admin commands
+- paginated results (shared page 1, private pageable copy, every bettor exactly once) and embed size limits with hundreds of bettors
 
 Tests use in-memory databases or temporary files under the OS temp directory.

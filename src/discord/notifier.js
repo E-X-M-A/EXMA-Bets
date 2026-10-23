@@ -5,7 +5,7 @@ const logger = require('../utils/logger');
 const { withRetry } = require('./retry');
 const { getPostableChannel } = require('./channels');
 const { resultEmbed, messageLink, COLORS } = require('./views');
-const { escapeMarkdown } = require('../utils/format');
+const { escapeMarkdown, points, signedPoints } = require('../utils/format');
 
 /**
  * Delivers queued notifications from the outbox table: creator reminders when a
@@ -33,15 +33,21 @@ class Notifier {
 
   async dispatchDue() {
     let delivered = 0;
-    for (const n of this.services.outbox.due(25)) {
-      try {
-        await this.deliver(n);
-        this.services.outbox.markSent(n.id);
-        delivered++;
-      } catch (err) {
-        logger.warn(`Notification ${n.id} (${n.kind}) failed: ${err.message ?? err}`);
-        this.services.outbox.markFailed(n.id, err.message ?? err, n.attempts);
+    // Up to 8 batches per run so a large market's result DMs go out promptly;
+    // anything left is picked up by the next scheduler tick.
+    for (let batch = 0; batch < 8; batch++) {
+      const due = this.services.outbox.due(25);
+      for (const n of due) {
+        try {
+          await this.deliver(n);
+          this.services.outbox.markSent(n.id);
+          delivered++;
+        } catch (err) {
+          logger.warn(`Notification ${n.id} (${n.kind}) failed: ${err.message ?? err}`);
+          this.services.outbox.markFailed(n.id, err.message ?? err, n.attempts);
+        }
       }
+      if (due.length < 25) break;
     }
     return delivered;
   }
@@ -55,6 +61,8 @@ class Notifier {
       case 'MARKET_RESOLVED':
       case 'MARKET_CANCELLED':
         return this.announceResult(market);
+      case 'BET_RESULT':
+        return this.notifyBettor(market, n.payload.userId);
       default:
         logger.warn(`Unknown notification kind ${n.kind}`);
     }
@@ -71,9 +79,10 @@ class Notifier {
       .setTitle(`⏰ Market #${market.id} has closed`)
       .setDescription(
         `Betting on **${escapeMarkdown(market.question)}** is closed. As the creator, please report the actual outcome ` +
-          `(${outcomes}) in <#${this.config.bettingChannelId}>:\n` +
+          `(${outcomes}) by pressing the matching **🏁 Resolve** button on the market message.${link}\n\n` +
+          `Alternatively, in <#${this.config.bettingChannelId}>: ` +
           `\`/market resolve market_id:${market.id} outcome:<outcome>\`\n\n` +
-          `Payouts are made as soon as you confirm the result.${link}`,
+          'Payouts are made as soon as you confirm the result, and every bettor’s result is shown on the market message.',
       );
 
     try {
@@ -97,6 +106,28 @@ class Notifier {
     );
   }
 
+  /** DMs one bettor what they won, lost or got refunded on a settled market. */
+  async notifyBettor(market, userId) {
+    const settlement = this.services.settlement.getSettlement(market.id);
+    const result = settlement?.payouts.find((p) => p.user_id === userId);
+    if (!result) return;
+    const embed = bettorResultEmbed(market, settlement, result, {
+      bets: this.services.markets.userBets(market.id, userId),
+      balance: this.services.users.getUser(userId)?.balance,
+      guildId: this.config.guildId,
+    });
+    try {
+      const user = await withRetry(() => this.client.users.fetch(userId), { label: 'fetch bettor' });
+      await withRetry(() => user.send({ embeds: [embed], allowedMentions: { parse: [] } }), {
+        label: `DM result of #${market.id}`,
+      });
+    } catch (err) {
+      // 50007: DMs closed; 10013: unknown user. The market message still lists their result.
+      if (![50007, 10013].includes(err.code)) throw err;
+      logger.debug(`Could not DM result of market #${market.id} to ${userId} (${err.code})`);
+    }
+  }
+
   async announceResult(market) {
     const { channel, problem } = await getPostableChannel(this.client, this.config.guildId, this.config.announcementChannelId);
     if (!channel || problem) throw new Error(`cannot announce result: ${problem}`);
@@ -112,4 +143,53 @@ class Notifier {
   }
 }
 
-module.exports = { Notifier };
+function bettorResultEmbed(market, settlement, result, { bets, balance, guildId }) {
+  const net = result.paid - result.staked;
+  const byOutcome = market.outcomes
+    .map((o) => ({ label: o.label, stake: bets.filter((b) => b.outcome === o.idx).reduce((a, b) => a + b.stake, 0) }))
+    .filter((o) => o.stake > 0)
+    .map((o) => `${points(o.stake)} on **${escapeMarkdown(o.label)}**`)
+    .join(', ');
+  const question = `**Market #${market.id}:** ${escapeMarkdown(market.question)}`;
+  const link = market.announcement_message_id
+    ? `\n[View market](${messageLink(guildId, market.announcement_channel_id, market.announcement_message_id)})`
+    : '';
+  const footer = balance == null ? '' : `\nYour balance: **${points(balance)}**`;
+
+  let title;
+  let color;
+  let body;
+  if (market.status === 'CANCELLED') {
+    title = `↩️ Market #${market.id} was cancelled`;
+    color = COLORS.CANCELLED;
+    body = `Reason: ${escapeMarkdown(market.cancel_reason ?? '—')}\nYour stake of ${points(result.staked)} was refunded.`;
+  } else {
+    const winner = escapeMarkdown(market.outcomes[market.winning_outcome].label);
+    if (settlement.refunded) {
+      title = '↩️ Your stake was refunded';
+      color = COLORS.CANCELLED;
+      body = `Result: **${winner}**. Nobody bet on it, so all stakes were refunded (${points(result.paid)} to you).`;
+    } else if (net > 0) {
+      title = `✅ You won ${signedPoints(net)}!`;
+      color = COLORS.SUCCESS;
+      body = `Result: **${winner}**. You staked ${points(result.staked)} and received **${points(result.paid)}**.`;
+    } else if (net === 0) {
+      title = '➖ You broke even';
+      color = COLORS.INFO;
+      body = `Result: **${winner}**. You staked ${points(result.staked)} and got ${points(result.paid)} back.`;
+    } else {
+      title = `❌ You lost ${points(-net)}`;
+      color = COLORS.ERROR;
+      body =
+        `Result: **${winner}**. You staked ${points(result.staked)}` +
+        (result.paid > 0 ? ` and got ${points(result.paid)} back.` : ' and lost it.');
+    }
+  }
+  return new EmbedBuilder()
+    .setColor(color)
+    .setTitle(title)
+    .setDescription(`${question}\n\n${body}\nYour bets: ${byOutcome || '—'}${footer}${link}`)
+    .setFooter({ text: 'Virtual points only — no real-money value.' });
+}
+
+module.exports = { Notifier, bettorResultEmbed };

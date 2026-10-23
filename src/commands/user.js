@@ -138,7 +138,7 @@ const help = {
           name: 'Betting',
           value:
             `New markets appear in <#${config.announcementChannelId}>. Click an outcome button, enter a stake ` +
-            `(min ${config.minBet}) and confirm. You can bet several times, on either side; placed bets are final.`,
+            `(min ${config.minBet}) and confirm. You can bet several times, on any outcome; placed bets are final.`,
         },
         {
           name: 'Payouts (pari-mutuel)',
@@ -150,7 +150,8 @@ const help = {
         {
           name: 'Lifecycle',
           value:
-            'Open → betting closes at the deadline → the creator reports the result with `/market resolve` → payouts. ' +
+            'Open → betting closes at the deadline → the creator presses the **🏁 Resolve** button for the real outcome ' +
+            '(or uses `/market resolve`) → payouts, and the market message lists what every bettor won or lost. ' +
             'Administrators can cancel a market (full refund) or resolve it if the creator is unavailable.',
         },
         {
