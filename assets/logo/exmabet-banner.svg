@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1360" height="480" viewBox="0 0 1360 480">
+  <!-- Discord profile banner: 680x240 (17:6), rendered at 2x -->
+  <rect width="1360" height="480" fill="#191F3B"/>
+  <g transform="translate(119 30) scale(0.75)">
+    <path d="M352 150
+             C 320 112, 236 104, 200 146
+             C 166 186, 196 236, 252 240
+             C 286 242, 290 214, 262 214
+             C 226 214, 150 238, 152 308
+             C 154 378, 250 404, 320 376
+             C 352 362, 372 376, 396 398"
+          fill="none" stroke="#FFFFFF" stroke-width="32" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+  <text x="476" y="267" font-family="Poppins, Montserrat, 'Helvetica Neue', Arial, 'DejaVu Sans', sans-serif"
+        font-size="130" font-weight="700" letter-spacing="6" fill="#FFFFFF">EXMABET</text>
+</svg>
