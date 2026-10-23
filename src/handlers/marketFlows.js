@@ -437,6 +437,17 @@ async function showResults(ctx, interaction, marketId, page, { flip = false } = 
   return respond(interaction, view);
 }
 
+/**
+ * "Bets" button: private view of who bet how much on which outcome. `flip` updates
+ * the viewer's own private copy (page buttons / outcome filter).
+ */
+async function showBets(ctx, interaction, marketId, { filter = 'a', page = 1, flip = false } = {}) {
+  const market = ctx.services.markets.requireMarket(marketId);
+  const view = views.betsView(market, ctx.services.markets.bettors(market), { filter, page, viewerId: interaction.user.id });
+  if (flip) return interaction.update({ ...view, allowedMentions: { parse: [] } });
+  return respond(interaction, view);
+}
+
 module.exports = {
   createModal,
   createMarket,
@@ -448,6 +459,7 @@ module.exports = {
   prepareResolve,
   resolveButton,
   showResults,
+  showBets,
   prepareCancel,
   handleConfirm,
   handleAbort,

@@ -104,7 +104,6 @@ class SettlementService {
         reason: isAdmin ? cleanReason(reason) : null,
         metadata: { winningOutcome, label: market.outcomes[winningOutcome].label, mode: result.mode, pools: result.pools },
       });
-      this.outbox.enqueue(`resolved:${market.id}`, 'MARKET_RESOLVED', market.id);
       this.enqueueBettorResults(market.id);
       return { ...summary, market: this.markets.getMarket(market.id) };
     });
@@ -141,7 +140,6 @@ class SettlementService {
         reason: why,
         metadata: { refunded: summary.totalPaid, bets: bets.length, previousStatus: market.status },
       });
-      this.outbox.enqueue(`cancelled:${market.id}`, 'MARKET_CANCELLED', market.id);
       this.enqueueBettorResults(market.id);
       return { ...summary, market: this.markets.getMarket(market.id) };
     });

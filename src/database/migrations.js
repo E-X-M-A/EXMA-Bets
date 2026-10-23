@@ -175,4 +175,14 @@ module.exports = [
       CREATE INDEX idx_notifications_pending ON notifications (status, next_attempt_at);
     `,
   },
+  {
+    version: 2,
+    name: 'key-value metadata',
+    up: `
+      CREATE TABLE meta (
+        key   TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      );
+    `,
+  },
 ];

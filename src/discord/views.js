@@ -1,6 +1,6 @@
 'use strict';
 
-const { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+const { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, StringSelectMenuBuilder } = require('discord.js');
 const { ids } = require('./customIds');
 const { points, signedPoints, truncate, safeName, progressBar, escapeMarkdown } = require('../utils/format');
 const { discordTimestamp } = require('../utils/time');
@@ -90,12 +90,35 @@ function bettorResultLines(settlement) {
 
 const RESULTS_PAGE_SIZE = 10;
 
+/**
+ * Bump whenever the market message layout (embed or buttons) changes. On startup,
+ * a changed version re-renders every published market message, so messages posted
+ * by an older version get the new buttons too.
+ *   1: initial  2: resolve buttons, results, Bets button, multi-outcome layout
+ *   3: payout summary on resolved markets (separate result posts removed)
+ *   4: re-render once more after the v3 rollout
+ */
+const LAYOUT_VERSION = 4;
+
 function resultsTitle(settlement) {
   const n = settlement.payouts.length;
   if (settlement.refunded) return `Results · all ${n} bettor${n === 1 ? '' : 's'} refunded`;
   const winners = settlement.payouts.filter((p) => p.paid > p.staked).length;
   const losers = settlement.payouts.filter((p) => p.paid < p.staked).length;
   return `Results · ${winners} won, ${losers} lost`;
+}
+
+/** One-line payout summary shown on a resolved market message. */
+function payoutSummary(market, settlement) {
+  if (!settlement.total_pool) return 'No bets were placed, so no points changed hands.';
+  if (settlement.refunded) {
+    return `Nobody bet on **${escapeMarkdown(market.outcomes[market.winning_outcome].label)}**, so all ${points(settlement.total_paid)} were refunded.`;
+  }
+  const losers = settlement.payouts.filter((p) => p.paid < p.staked).length;
+  return (
+    `${settlement.winner_count} winner${settlement.winner_count === 1 ? '' : 's'} shared **${points(settlement.total_paid)}**; ` +
+    `${losers} bettor${losers === 1 ? '' : 's'} lost.`
+  );
 }
 
 /** One page of result lines: `{ lines, page, pages, total }` (page is clamped). */
@@ -185,7 +208,7 @@ function marketEmbed(market, { now = Date.now(), settlement = null } = {}) {
       name: 'Resolved',
       value: `${discordTimestamp(market.resolved_at, 'f')} by <@${market.resolver_id}>${market.resolved_by_admin ? ' (administrator)' : ''}`,
     });
-    if (settlement) embed.addFields(resultFields(settlement));
+    if (settlement) embed.addFields({ name: 'Payouts', value: payoutSummary(market, settlement) }, ...resultFields(settlement));
   }
   return embed;
 }
@@ -200,7 +223,7 @@ function buttonRows(buttons) {
 /**
  * Market buttons, laid out within Discord's 5 rows x 5 buttons:
  * - one "Bet" button per outcome (disabled once betting closes)
- * - utility buttons: "My position", "All results" (resolved markets with more than
+ * - utility buttons: "My position", "Bets" (who bet what), "All results" (resolved markets with more than
  *   one page of results) and an optional link button (`linkUrl`)
  * - after betting closes and until the market is settled, one "Resolve" button per
  *   outcome (usable by the creator or an administrator)
@@ -219,6 +242,11 @@ function marketComponents(market, { now = Date.now(), settlement = null, linkUrl
   );
   const utility = [
     new ButtonBuilder().setCustomId(ids.position(market.id)).setLabel('My position').setEmoji('👤').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId(ids.bets(market.id))
+      .setLabel(market.participants ? `Bets (${market.participants})` : 'Bets')
+      .setEmoji('👥')
+      .setStyle(ButtonStyle.Secondary),
   ];
   if (market.status === 'RESOLVED' && settlement && settlement.payouts.length > RESULTS_PAGE_SIZE) {
     utility.push(
@@ -255,50 +283,6 @@ function marketMessage(market, opts) {
   return { embeds: [marketEmbed(market, opts)], components: marketComponents(market, opts), allowedMentions: { parse: [] } };
 }
 
-function resultEmbed(market, settlement, { guildId } = {}) {
-  const link =
-    market.announcement_message_id && guildId
-      ? `\n[View market](${messageLink(guildId, market.announcement_channel_id, market.announcement_message_id)})`
-      : '';
-  const pools = market.outcomes.map((o) => `${outcomeIcon(o.idx)} ${escapeMarkdown(o.label)}: ${points(o.pool)}`).join('\n');
-
-  if (market.status === 'CANCELLED') {
-    return new EmbedBuilder()
-      .setColor(COLORS.CANCELLED)
-      .setTitle(truncate(`⛔ Market #${market.id} cancelled`, 256))
-      .setDescription(
-        `**${escapeMarkdown(market.question)}**\n\nReason: ${escapeMarkdown(market.cancel_reason ?? '—')}\n` +
-          `All ${points(settlement?.total_paid ?? 0)} in stakes were refunded.${link}`,
-      )
-      .addFields({ name: 'Final pools', value: pools });
-  }
-
-  const winner = market.outcomes[market.winning_outcome];
-  let summary;
-  if (!settlement || settlement.total_pool === 0) summary = 'No bets were placed, so no points changed hands.';
-  else if (settlement.refunded) summary = `Nobody backed **${escapeMarkdown(winner.label)}**, so every stake was refunded.`;
-  else {
-    const top = settlement.payouts
-      .filter((p) => p.paid > p.staked)
-      .slice(0, 5)
-      .map((p) => `<@${p.user_id}> ${points(p.paid)} (${signedPoints(p.paid - p.staked)})`);
-    summary =
-      `${settlement.winner_count} winner${settlement.winner_count === 1 ? '' : 's'} shared ${points(settlement.total_paid)}.` +
-      (top.length ? `\n${top.join('\n')}` : '');
-  }
-  return new EmbedBuilder()
-    .setColor(COLORS.RESOLVED)
-    .setTitle(truncate(`🏁 Market #${market.id} resolved: ${winner.label}`, 256))
-    .setDescription(`**${escapeMarkdown(market.question)}**${link}`)
-    .addFields(
-      { name: 'Winning outcome', value: `✅ ${escapeMarkdown(winner.label)}`, inline: true },
-      { name: 'Total pool', value: points(settlement?.total_pool ?? 0), inline: true },
-      { name: 'Final pools', value: pools },
-      { name: 'Payouts', value: truncate(summary, 1024) },
-    )
-    .setFooter({ text: `Resolved by ${market.resolved_by_admin ? 'an administrator' : 'the market creator'}` });
-}
-
 function infoEmbed(title, description, color = COLORS.INFO) {
   return new EmbedBuilder().setColor(color).setTitle(title).setDescription(description);
 }
@@ -316,6 +300,84 @@ function confirmRow(confirmationId, confirmLabel = 'Confirm', style = ButtonStyl
     new ButtonBuilder().setCustomId(ids.confirm(confirmationId)).setLabel(confirmLabel).setStyle(style),
     new ButtonBuilder().setCustomId(ids.abort(confirmationId)).setLabel('Cancel').setStyle(ButtonStyle.Secondary),
   );
+}
+
+const BETS_PAGE_SIZE = 10;
+
+/** "🔵 300 · 🟠 50": a bettor's stakes per outcome, compact (icons match the summary). */
+function stakeBreakdown(stakes) {
+  return stakes
+    .map((s, idx) => (s > 0 ? `${outcomeIcon(idx)} ${s.toLocaleString('en-US')}` : null))
+    .filter(Boolean)
+    .join(' · ');
+}
+
+/**
+ * Private "Bets" view: per-outcome summary, the viewer's own stakes, and a
+ * paginated list of bettors (biggest stake first), optionally filtered to one
+ * outcome via the select menu.
+ */
+function betsView(market, bettors, { filter = 'a', page = 1, viewerId } = {}) {
+  const idx = filter === 'a' ? null : Number(filter);
+  const outcome = idx == null ? null : market.outcomes[idx] ?? null;
+  const list = (outcome
+    ? bettors.filter((b) => b.stakes[outcome.idx] > 0).sort((a, b) => b.stakes[outcome.idx] - a.stakes[outcome.idx])
+    : bettors);
+  const pages = Math.max(1, Math.ceil(list.length / BETS_PAGE_SIZE));
+  const current = Math.min(Math.max(1, page), pages);
+  const offset = (current - 1) * BETS_PAGE_SIZE;
+
+  const summary = market.outcomes.map(
+    (o) =>
+      `${outcomeIcon(o.idx)} **${escapeMarkdown(truncate(o.label, 30))}** — ${points(o.pool)} · ` +
+      `${o.bettors} bettor${o.bettors === 1 ? '' : 's'} · ${o.probability.toFixed(1)}%`,
+  );
+  const lines = list.slice(offset, offset + BETS_PAGE_SIZE).map((b, i) => {
+    const amount = outcome ? b.stakes[outcome.idx] : b.total;
+    const detail = outcome ? '' : ` — ${stakeBreakdown(b.stakes)}`;
+    return `\`${String(offset + i + 1).padStart(2, ' ')}.\` <@${b.userId}> **${points(amount)}**${detail}`;
+  });
+  const own = bettors.find((b) => b.userId === viewerId);
+  const heading = outcome
+    ? `**Bettors on ${escapeMarkdown(truncate(outcome.label, 50))}** (${list.length})`
+    : `**All bettors** (${list.length})`;
+
+  const embed = new EmbedBuilder()
+    .setColor(COLORS.INFO)
+    .setTitle(truncate(`👥 Bets · Market #${market.id}`, 256))
+    .setDescription(
+      [
+        `**${escapeMarkdown(truncate(market.question, 300))}**`,
+        '',
+        ...summary,
+        `Total: **${points(market.totalPool)}** from ${market.participants} bettor${market.participants === 1 ? '' : 's'}`,
+        '',
+        own ? `**Your bets:** ${stakeBreakdown(own.stakes)} (${points(own.total)})` : '*You have not bet on this market.*',
+        '',
+        heading,
+        lines.length ? lines.join('\n') : 'No bets yet.',
+      ]
+        .join('\n')
+        .slice(0, 4096), // hard cap: worst case (10 long outcomes, huge stakes) stays within Discord's limit
+    )
+    .setFooter({ text: `Page ${current}/${pages} · biggest stake first · amounts in points` });
+
+  const select = new StringSelectMenuBuilder()
+    .setCustomId(ids.betsFilter(market.id))
+    .setPlaceholder('Filter by outcome')
+    .addOptions(
+      { label: 'All outcomes', value: 'a', default: outcome == null },
+      ...market.outcomes.map((o) => ({
+        label: truncate(o.label, 100),
+        value: String(o.idx),
+        description: truncate(`${points(o.pool)} · ${o.bettors} bettor${o.bettors === 1 ? '' : 's'}`, 100),
+        emoji: outcomeIcon(o.idx),
+        default: outcome?.idx === o.idx,
+      })),
+    );
+  const components = [new ActionRowBuilder().addComponents(select)];
+  if (pages > 1) components.push(pagerRow((p) => ids.betsPage(market.id, outcome ? outcome.idx : 'a', p), current, pages));
+  return { embeds: [embed], components };
 }
 
 /** Prev / indicator / Next. Only used when pages > 1, which keeps the custom IDs distinct. */
@@ -396,7 +458,9 @@ module.exports = {
   resultFields,
   resultsView,
   RESULTS_PAGE_SIZE,
-  resultEmbed,
+  betsView,
+  BETS_PAGE_SIZE,
+  LAYOUT_VERSION,
   infoEmbed,
   errorEmbed,
   successEmbed,

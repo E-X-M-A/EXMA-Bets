@@ -53,6 +53,8 @@ class MarketService {
         FROM bets WHERE market_id = ? GROUP BY outcome`),
       participants: db.prepare('SELECT COUNT(DISTINCT user_id) FROM bets WHERE market_id = ?').pluck(),
       userBets: db.prepare('SELECT * FROM bets WHERE market_id = ? AND user_id = ? ORDER BY id'),
+      bettorStakes: db.prepare(`SELECT user_id, outcome, SUM(stake) AS stake, COUNT(*) AS bets, MIN(id) AS first_bet
+        FROM bets WHERE market_id = ? GROUP BY user_id, outcome`),
       expiredOpen: db.prepare("SELECT id FROM markets WHERE status = 'OPEN' AND expires_at <= ? ORDER BY expires_at"),
       close: db.prepare(`UPDATE markets SET status = 'AWAITING_RESOLUTION', closed_at = ?, sync_version = sync_version + 1
         WHERE id = ? AND status = 'OPEN' AND expires_at <= ?`),
@@ -63,6 +65,11 @@ class MarketService {
       markSynced: db.prepare('UPDATE markets SET synced_version = max(synced_version, ?) WHERE id = ?'),
       needsSync: db.prepare('SELECT id FROM markets WHERE synced_version < sync_version ORDER BY id LIMIT ?').pluck(),
       count: db.prepare('SELECT COUNT(*) FROM markets WHERE status = ?').pluck(),
+      getMeta: db.prepare('SELECT value FROM meta WHERE key = ?').pluck(),
+      setMeta: db.prepare('INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value'),
+      bumpPublished: db.prepare(
+        'UPDATE markets SET sync_version = sync_version + 1 WHERE announcement_message_id IS NOT NULL',
+      ),
       list: db.prepare(`SELECT id FROM markets WHERE status = ?
         ORDER BY CASE WHEN status = 'OPEN' THEN expires_at END ASC, id DESC LIMIT ? OFFSET ?`),
       search: db.prepare(`SELECT id, question, status, expires_at FROM markets
@@ -192,6 +199,25 @@ class MarketService {
   }
 
   /**
+   * Everyone who bet on a market: `{ userId, stakes: [per outcome], total, bets }`,
+   * biggest total first (ties: earliest first bet, then user id).
+   */
+  bettors(market) {
+    const byUser = new Map();
+    for (const r of this.stmts.bettorStakes.all(market.id)) {
+      if (!byUser.has(r.user_id)) {
+        byUser.set(r.user_id, { userId: r.user_id, stakes: market.outcomes.map(() => 0), total: 0, bets: 0, firstBet: r.first_bet });
+      }
+      const b = byUser.get(r.user_id);
+      b.stakes[r.outcome] += r.stake;
+      b.total += r.stake;
+      b.bets += r.bets;
+      b.firstBet = Math.min(b.firstBet, r.first_bet);
+    }
+    return [...byUser.values()].sort((a, b) => b.total - a.total || a.firstBet - b.firstBet || a.userId.localeCompare(b.userId));
+  }
+
+  /**
    * Moves every OPEN market whose expiry has passed to AWAITING_RESOLUTION and
    * queues one creator notification per market. Idempotent and safe after downtime.
    */
@@ -211,6 +237,20 @@ class MarketService {
 
   setAnnouncementMessage(marketId, channelId, messageId) {
     this.stmts.setMessage.run(channelId, messageId, marketId);
+  }
+
+  /**
+   * If the message layout changed since the last run, flags every published market
+   * message for re-rendering (the sync worker then edits them in the background).
+   * Returns the number of messages queued.
+   */
+  refreshLayout(layoutVersion) {
+    return tx(this.db, () => {
+      if (this.stmts.getMeta.get('market_layout_version') === String(layoutVersion)) return 0;
+      const queued = this.stmts.bumpPublished.run().changes;
+      this.stmts.setMeta.run('market_layout_version', String(layoutVersion));
+      return queued;
+    });
   }
 
   /** Flags the published embed as stale so the sync worker re-renders it. */

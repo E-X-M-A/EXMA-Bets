@@ -11,6 +11,7 @@ const { getPostableChannel } = require('./discord/channels');
 const { createMemberSource } = require('./discord/members');
 const { createInteractionHandler } = require('./handlers/interactionHandler');
 const { Scheduler } = require('./scheduler');
+const { LAYOUT_VERSION } = require('./discord/views');
 
 async function main() {
   loadDotEnv();
@@ -75,6 +76,8 @@ async function main() {
       const { problem } = await getPostableChannel(c, config.guildId, id);
       if (problem) logger.error(`${name}: ${problem}. Related features will fail until this is fixed.`);
     }
+    const refreshed = services.markets.refreshLayout(LAYOUT_VERSION);
+    if (refreshed) logger.info(`Market layout changed: refreshing ${refreshed} published market message(s).`);
     await scheduler.start();
     logger.info('Scheduler started; startup reconciliation complete.');
   });

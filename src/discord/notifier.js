@@ -4,12 +4,13 @@ const { EmbedBuilder } = require('discord.js');
 const logger = require('../utils/logger');
 const { withRetry } = require('./retry');
 const { getPostableChannel } = require('./channels');
-const { resultEmbed, messageLink, COLORS } = require('./views');
+const { messageLink, COLORS } = require('./views');
 const { escapeMarkdown, points, signedPoints } = require('../utils/format');
 
 /**
  * Delivers queued notifications from the outbox table: creator reminders when a
- * market closes, and result/cancellation announcements. Each row is delivered at
+ * market closes and per-bettor result DMs. (Results themselves are shown on the
+ * market message, which the MarketPublisher keeps up to date.) Each row is delivered at
  * most once under normal operation (status flips to SENT after delivery) and is
  * retried with backoff when Discord fails.
  */
@@ -60,7 +61,9 @@ class Notifier {
         return this.notifyCreator(market);
       case 'MARKET_RESOLVED':
       case 'MARKET_CANCELLED':
-        return this.announceResult(market);
+        // Results are shown on the market message itself; separate result posts were
+        // removed. Rows queued by older versions are simply marked as handled.
+        return undefined;
       case 'BET_RESULT':
         return this.notifyBettor(market, n.payload.userId);
       default:
@@ -126,20 +129,6 @@ class Notifier {
       if (![50007, 10013].includes(err.code)) throw err;
       logger.debug(`Could not DM result of market #${market.id} to ${userId} (${err.code})`);
     }
-  }
-
-  async announceResult(market) {
-    const { channel, problem } = await getPostableChannel(this.client, this.config.guildId, this.config.announcementChannelId);
-    if (!channel || problem) throw new Error(`cannot announce result: ${problem}`);
-    const settlement = this.services.settlement.getSettlement(market.id);
-    const payload = {
-      embeds: [resultEmbed(market, settlement, { guildId: this.config.guildId })],
-      allowedMentions: { parse: [] },
-    };
-    if (market.announcement_message_id && market.announcement_channel_id === channel.id) {
-      payload.reply = { messageReference: market.announcement_message_id, failIfNotExists: false };
-    }
-    await withRetry(() => channel.send(payload), { label: `announce result of #${market.id}` });
   }
 }
 

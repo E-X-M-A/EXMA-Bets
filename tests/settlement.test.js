@@ -213,7 +213,8 @@ test('cancellation refunds every unsettled stake and is audited', () => {
   assert.equal(market.cancelled_by, uid(9));
   assert.equal(market.cancel_reason, 'ambiguous question');
   assert.equal(db.prepare("SELECT COUNT(*) FROM audit_logs WHERE action = 'ADMIN_MARKET_CANCEL'").pluck().get(), 1);
-  assert.equal(db.prepare("SELECT COUNT(*) FROM notifications WHERE kind = 'MARKET_CANCELLED'").pluck().get(), 1);
+  // One refund DM per bettor (uid 2 and uid 3); no separate cancellation post.
+  assert.deepEqual(db.prepare('SELECT kind, COUNT(*) AS n FROM notifications GROUP BY kind').all(), [{ kind: 'BET_RESULT', n: 2 }]);
   assertLedgerConsistent(assert, db);
 });
 

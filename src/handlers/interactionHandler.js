@@ -111,6 +111,11 @@ function parseOutcomeLines(text) {
 
 async function handleComponent(ctx, interaction) {
   const parsed = parseCustomId(interaction.customId);
+  if (parsed?.type === 'betsFilter' && interaction.isStringSelectMenu()) {
+    const value = interaction.values[0];
+    if (!/^(a|\d{1,2})$/.test(value)) throw new UserError('Unknown filter.');
+    return flows.showBets(ctx, interaction, Number(parsed.args[0]), { filter: value, page: 1, flip: true });
+  }
   if (!parsed || !interaction.isButton()) throw new UserError('This button is outdated.');
   const [a, b, c] = parsed.args;
   switch (parsed.type) {
@@ -122,6 +127,10 @@ async function handleComponent(ctx, interaction) {
       return flows.resolveButton(ctx, interaction, Number(a), Number(b));
     case 'results':
       return flows.showResults(ctx, interaction, Number(a), 1);
+    case 'bets':
+      return flows.showBets(ctx, interaction, Number(a));
+    case 'betsPage':
+      return flows.showBets(ctx, interaction, Number(a), { filter: b, page: Number(c), flip: true });
     case 'resultsPage':
       return flows.showResults(ctx, interaction, Number(a), Number(b), { flip: true });
     case 'confirm':
